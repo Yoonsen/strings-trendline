@@ -1,0 +1,19 @@
+{
+  "name": "NB Boktrend",
+  "short_name": "Boktrend",
+  "description": "Trendlinje for antall bøker per år fra Nasjonalbibliotekets søke-API.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f7f8fa",
+  "theme_color": "#005aa7",
+  "lang": "nb",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

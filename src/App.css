@@ -1,0 +1,124 @@
+.container {
+  width: min(100%, 900px);
+  margin: 0 auto;
+  padding: 2rem 1rem 3rem;
+  display: grid;
+  gap: 1rem;
+}
+
+h1 {
+  margin-bottom: 0.5rem;
+}
+
+p {
+  margin: 0;
+}
+
+.search-form {
+  display: grid;
+  gap: 0.75rem;
+  text-align: left;
+  background: #ffffff;
+  border: 1px solid #d9d9d9;
+  border-radius: 0.75rem;
+  padding: 1rem;
+}
+
+.mode-switch {
+  display: inline-flex;
+  width: fit-content;
+  border: 1px solid #b3b3b3;
+  border-radius: 0.5rem;
+  overflow: hidden;
+}
+
+.mode-button {
+  border-radius: 0;
+  color: #1f2937;
+  background: #ffffff;
+  padding: 0.5rem 0.85rem;
+}
+
+.mode-button.active {
+  color: #ffffff;
+  background: #005aa7;
+}
+
+.search-form textarea,
+.search-form input[type='text'],
+.search-form input[type='number'],
+.search-form select {
+  font: inherit;
+  padding: 0.6rem 0.75rem;
+  border-radius: 0.5rem;
+  border: 1px solid #b3b3b3;
+}
+
+.search-form textarea {
+  resize: vertical;
+}
+
+.search-form input[type='range'] {
+  width: 100%;
+}
+
+.controls-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.75rem;
+}
+
+.controls-grid label {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.checkbox {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+button {
+  width: fit-content;
+  font: inherit;
+  border: 0;
+  border-radius: 0.5rem;
+  padding: 0.65rem 1rem;
+  cursor: pointer;
+  color: #ffffff;
+  background: #005aa7;
+}
+
+button:disabled {
+  cursor: wait;
+  opacity: 0.8;
+}
+
+.error {
+  color: #b00020;
+}
+
+.hint {
+  color: #666666;
+}
+
+.chart-section {
+  background: #ffffff;
+  border: 1px solid #d9d9d9;
+  border-radius: 0.75rem;
+  padding: 1rem;
+}
+
+.meta {
+  margin-bottom: 1rem;
+}
+
+.meta h2 {
+  margin: 0 0 0.35rem;
+}
+
+.chart-wrapper {
+  width: 100%;
+  min-height: 360px;
+}
