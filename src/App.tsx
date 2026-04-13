@@ -1,4 +1,4 @@
-import { useMemo, useState, type FormEvent } from 'react'
+import { useMemo, useRef, useState, type FormEvent } from 'react'
 import {
   CartesianGrid,
   Legend,
@@ -13,6 +13,8 @@ import './App.css'
 
 type MediaMode = 'books' | 'newspapers'
 type TemporalGranularity = 'year' | 'month' | 'day'
+type DetailWindowYears = 1 | 2 | 5 | 10
+type AppView = 'trend' | 'snippets'
 
 type TrendPoint = {
   bucket: string
@@ -28,6 +30,13 @@ type TrendSeries = {
   totalHits: number
 }
 
+type SnippetHit = {
+  itemId: string
+  pageId?: string
+  pageNumber?: string
+  text: string
+}
+
 type YearBucket = {
   year: number
   count: number
@@ -35,9 +44,11 @@ type YearBucket = {
 
 const SEARCH_API_BASE_URL = 'https://api.nb.no/catalog/v1/search'
 const ITEMS_API_BASE_URL = 'https://api.nb.no/catalog/v1/items'
+const ITEM_SEARCHAFTER_API_BASE_URL = 'https://api.nb.no/catalog/v1/items/searchafter'
 const AGG_SIZE = '1000'
 const ITEMS_PAGE_SIZE = 100
 const MAX_PAGES_PER_YEAR = 20
+const SNIPPET_BATCH_SIZE = 50
 const MIN_YEAR = 1000
 const MAX_YEAR = new Date().getFullYear()
 const COLOR_PALETTE = ['#005aa7', '#d9480f', '#2b8a3e', '#5f3dc4', '#0b7285']
@@ -65,6 +76,27 @@ const parsePhrases = (input: string): string[] =>
         .filter(Boolean),
     ),
   )
+
+const stripHtml = (value: string): string => value.replace(/<[^>]*>/g, '')
+
+const downloadTextFile = (
+  filename: string,
+  mimeType: string,
+  content: string,
+): void => {
+  const blob = new Blob([content], { type: mimeType })
+  const objectUrl = URL.createObjectURL(blob)
+  const anchor = document.createElement('a')
+  anchor.href = objectUrl
+  anchor.download = filename
+  anchor.click()
+  URL.revokeObjectURL(objectUrl)
+}
+
+const escapeCsv = (value: string): string => {
+  const escaped = value.replaceAll('"', '""')
+  return `"${escaped}"`
+}
 
 const toYearBucketPoint = (
   bucket: YearBucket,
@@ -238,10 +270,113 @@ const fetchIssuedBuckets = async (
     .sort((a, b) => a.sortValue - b.sortValue)
 }
 
+type ItemsPage = {
+  items: Array<{ id: string; issuedYear?: number }>
+  hasMore: boolean
+}
+
+const fetchItemsPage = async (
+  query: string,
+  mode: MediaMode,
+  digitalAccessibleOnly: boolean,
+  searchAfterId?: string,
+): Promise<ItemsPage> => {
+  const params = new URLSearchParams({
+    q: query,
+    filter: `mediatype:${MODE_CONFIG[mode].mediatypeFilter}`,
+    searchType: 'FULL_TEXT_SEARCH',
+    size: String(SNIPPET_BATCH_SIZE),
+    page: '0',
+  })
+
+  if (digitalAccessibleOnly) {
+    params.set('digitalAccessibleOnly', 'true')
+  }
+  if (searchAfterId) {
+    params.set('searchAfterId', searchAfterId)
+  }
+
+  const endpoint = searchAfterId ? ITEM_SEARCHAFTER_API_BASE_URL : ITEMS_API_BASE_URL
+  const response = await fetch(`${endpoint}?${params.toString()}`)
+  if (!response.ok) {
+    throw new Error(`NB items-API feilet med status ${response.status}`)
+  }
+
+  const data = (await response.json()) as {
+    _embedded?: {
+      items?: Array<{ id?: string; metadata?: { originInfo?: { issued?: string } } }>
+    }
+    _links?: { next?: { href?: string } }
+  }
+
+  const items: Array<{ id: string; issuedYear?: number }> = []
+  for (const item of data._embedded?.items ?? []) {
+    if (!item.id) {
+      continue
+    }
+
+    const issued = item.metadata?.originInfo?.issued
+    const issuedYear =
+      issued && /^\d{8}$/.test(issued) ? Number(issued.slice(0, 4)) : undefined
+
+    items.push({ id: item.id, issuedYear })
+  }
+
+  return {
+    items,
+    hasMore: Boolean(data._links?.next?.href) && items.length > 0,
+  }
+}
+
+const fetchItemSnippets = async (
+  itemId: string,
+  query: string,
+  fragments: number,
+  fragSize: number,
+): Promise<SnippetHit[]> => {
+  const params = new URLSearchParams({
+    q: query,
+    fragments: String(fragments),
+    fragSize: String(fragSize),
+  })
+
+  const response = await fetch(
+    `${ITEMS_API_BASE_URL}/${itemId}/contentfragments?${params.toString()}`,
+  )
+  if (!response.ok) {
+    throw new Error(`NB fragments-API feilet med status ${response.status}`)
+  }
+
+  const data = (await response.json()) as {
+    contentFragments?: Array<{
+      pageid?: string
+      pageNumber?: string
+      text?: string
+    }>
+  }
+
+  const hits: SnippetHit[] = []
+  for (const fragment of data.contentFragments ?? []) {
+    if (!fragment.text) {
+      continue
+    }
+
+    hits.push({
+      itemId,
+      pageId: fragment.pageid,
+      pageNumber: fragment.pageNumber,
+      text: fragment.text,
+    })
+  }
+
+  return hits
+}
+
 function App() {
+  const [appView, setAppView] = useState<AppView>('trend')
   const [mode, setMode] = useState<MediaMode>('books')
   const [granularity, setGranularity] = useState<TemporalGranularity>('year')
-  const [detailPeriodYears, setDetailPeriodYears] = useState<5 | 10>(5)
+  const [detailPeriodYears, setDetailPeriodYears] = useState<DetailWindowYears>(5)
   const [queryInput, setQueryInput] = useState('hamsun')
   const [digitalAccessibleOnly, setDigitalAccessibleOnly] = useState(false)
   const [loading, setLoading] = useState(false)
@@ -251,12 +386,29 @@ function App() {
   const [strokeWidth, setStrokeWidth] = useState(2)
   const [error, setError] = useState<string | null>(null)
   const [series, setSeries] = useState<TrendSeries[]>([])
+  const [maxSnippetDocuments, setMaxSnippetDocuments] = useState(200)
+  const [snippetFragments, setSnippetFragments] = useState(2)
+  const [snippetFragSize, setSnippetFragSize] = useState(250)
+  const [snippetHits, setSnippetHits] = useState<SnippetHit[]>([])
+  const [snippetProgress, setSnippetProgress] = useState({
+    scanned: 0,
+    withSnippets: 0,
+    target: 0,
+    running: false,
+  })
+  const snippetStopRef = useRef(false)
   const modeMeta = MODE_CONFIG[mode]
+  const exportTimestamp = new Date().toISOString().replaceAll(':', '-')
 
   const detailMode = mode === 'newspapers' && granularity !== 'year'
+  const detailWindowOptions: DetailWindowYears[] =
+    granularity === 'day' ? [1, 2] : [5, 10]
+  const effectiveDetailPeriodYears = detailWindowOptions.includes(detailPeriodYears)
+    ? detailPeriodYears
+    : detailWindowOptions[0]
   const selectedToYear = Math.min(MAX_YEAR, Math.max(fromYear, toYear))
   const selectedFromYear = detailMode
-    ? selectedToYear - detailPeriodYears + 1
+    ? selectedToYear - effectiveDetailPeriodYears + 1
     : Math.max(MIN_YEAR, Math.min(fromYear, toYear))
 
   const filteredSeries = useMemo(() => {
@@ -307,6 +459,43 @@ function App() {
       .map((row) => ({ bucket: row.bucket, ...row.values }))
   }, [detailMode, filteredSeries, relativeMode])
 
+  const exportSnippetsAsJson = (): void => {
+    const payload = {
+      exportedAt: new Date().toISOString(),
+      mode,
+      query: queryInput,
+      snippets: snippetHits.map((hit) => ({
+        itemId: hit.itemId,
+        pageId: hit.pageId ?? '',
+        pageNumber: hit.pageNumber ?? '',
+        rawHtml: hit.text,
+        plainText: stripHtml(hit.text),
+      })),
+    }
+
+    downloadTextFile(
+      `nb-snippets-${exportTimestamp}.json`,
+      'application/json;charset=utf-8',
+      JSON.stringify(payload, null, 2),
+    )
+  }
+
+  const exportSnippetsAsCsv = (): void => {
+    const header = ['item_id', 'page_id', 'page_number', 'raw_html', 'plain_text']
+    const rows = snippetHits.map((hit) =>
+      [
+        hit.itemId,
+        hit.pageId ?? '',
+        hit.pageNumber ?? '',
+        hit.text,
+        stripHtml(hit.text),
+      ].map((value) => escapeCsv(value)),
+    )
+
+    const content = [header.join(','), ...rows.map((row) => row.join(','))].join('\n')
+    downloadTextFile(`nb-snippets-${exportTimestamp}.csv`, 'text/csv;charset=utf-8', content)
+  }
+
   const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
 
@@ -320,6 +509,71 @@ function App() {
     setError(null)
 
     try {
+      if (appView === 'snippets') {
+        if (phrases.length > 1) {
+          throw new Error('Snippets støtter foreløpig én frase per kjøring.')
+        }
+
+        const query = phrases[0]
+        let searchAfterId: string | undefined
+        let hasMore = true
+        let scanned = 0
+        let withSnippets = 0
+        const target = Math.max(1, maxSnippetDocuments)
+        const collectedHits: SnippetHit[] = []
+
+        snippetStopRef.current = false
+        setSnippetHits([])
+        setSnippetProgress({ scanned: 0, withSnippets: 0, target, running: true })
+
+        while (scanned < target && hasMore && !snippetStopRef.current) {
+          const page = await fetchItemsPage(
+            query,
+            mode,
+            digitalAccessibleOnly,
+            searchAfterId,
+          )
+          if (page.items.length === 0) {
+            break
+          }
+
+          for (const item of page.items) {
+            if (scanned >= target || snippetStopRef.current) {
+              break
+            }
+
+            if (
+              item.issuedYear !== undefined &&
+              (item.issuedYear < selectedFromYear || item.issuedYear > selectedToYear)
+            ) {
+              continue
+            }
+
+            scanned += 1
+            const snippets = await fetchItemSnippets(
+              item.id,
+              query,
+              snippetFragments,
+              snippetFragSize,
+            )
+            if (snippets.length > 0) {
+              withSnippets += 1
+              collectedHits.push(...snippets)
+            }
+
+            setSnippetProgress({ scanned, withSnippets, target, running: true })
+          }
+
+          searchAfterId = page.items.at(-1)?.id
+          hasMore = page.hasMore && Boolean(searchAfterId)
+        }
+
+        setSnippetHits(collectedHits)
+        setSeries([])
+        setSnippetProgress((progress) => ({ ...progress, running: false }))
+        return
+      }
+
       if (detailMode) {
         const detailSeries = await Promise.all(
           phrases.map(async (phrase) => {
@@ -364,10 +618,12 @@ function App() {
           }),
         )
         setSeries(trendSeries)
+        setSnippetHits([])
       }
     } catch (requestError) {
       setError(getErrorMessage(requestError))
       setSeries([])
+      setSnippetProgress((progress) => ({ ...progress, running: false }))
     } finally {
       setLoading(false)
     }
@@ -376,13 +632,30 @@ function App() {
   return (
     <main className="container">
       <header>
-        <h1>Trendlinjer for OsloMet</h1>
+        <h1>NB Trendlinjer</h1>
         <p>
           Sjekk hvor mange {modeMeta.resultNoun} som matcher en frase i NB.
         </p>
       </header>
 
       <form className="search-form" onSubmit={handleSubmit}>
+        <div className="mode-switch" role="group" aria-label="Visningstype">
+          <button
+            type="button"
+            className={appView === 'trend' ? 'mode-button active' : 'mode-button'}
+            onClick={() => setAppView('trend')}
+          >
+            Trend
+          </button>
+          <button
+            type="button"
+            className={appView === 'snippets' ? 'mode-button active' : 'mode-button'}
+            onClick={() => setAppView('snippets')}
+          >
+            Snippets
+          </button>
+        </div>
+
         <div className="mode-switch" role="group" aria-label="Materialtype">
           <button
             type="button"
@@ -403,75 +676,152 @@ function App() {
           </button>
         </div>
 
-        <label htmlFor="granularity">
-          Tidsoppløsning
-          <select
-            id="granularity"
-            value={granularity}
-            onChange={(event) =>
-              setGranularity(event.target.value as TemporalGranularity)
-            }
-          >
-            <option value="year">År</option>
-            <option value="month" disabled={mode !== 'newspapers'}>
-              Måned
-            </option>
-            <option value="day" disabled={mode !== 'newspapers'}>
-              Dag
-            </option>
-          </select>
-        </label>
+        {appView === 'trend' ? (
+          <label htmlFor="granularity">
+            Tidsoppløsning
+            <select
+              id="granularity"
+              value={granularity}
+              onChange={(event) =>
+                setGranularity(event.target.value as TemporalGranularity)
+              }
+            >
+              <option value="year">År</option>
+              <option value="month" disabled={mode !== 'newspapers'}>
+                Måned
+              </option>
+              <option value="day" disabled={mode !== 'newspapers'}>
+                Dag
+              </option>
+            </select>
+          </label>
+        ) : null}
 
-        <label htmlFor="query">Fraser (én per linje eller komma-separert)</label>
+        <label htmlFor="query">
+          {appView === 'snippets'
+            ? 'Frase for snippets'
+            : 'Fraser (én per linje eller komma-separert)'}
+        </label>
         <textarea
           id="query"
           value={queryInput}
           onChange={(event) => setQueryInput(event.target.value)}
-          placeholder="f.eks. hamsun&#10;og&#10;i natt"
-          rows={4}
+          placeholder={
+            appView === 'snippets'
+              ? 'f.eks. hamsun'
+              : 'f.eks. hamsun&#10;og&#10;i natt'
+          }
+          rows={appView === 'snippets' ? 2 : 4}
         />
 
-        <div className="controls-grid">
-          <label htmlFor="fromYear">
-            Fra år
-            <input
-              id="fromYear"
-              type="number"
-              min={MIN_YEAR}
-              max={MAX_YEAR}
-              value={selectedFromYear}
-              onChange={(event) => setFromYear(Number(event.target.value))}
-              disabled={detailMode}
-            />
-          </label>
-          <label htmlFor="toYear">
-            Til år
-            <input
-              id="toYear"
-              type="number"
-              min={MIN_YEAR}
-              max={MAX_YEAR}
-              value={selectedToYear}
-              onChange={(event) => setToYear(Number(event.target.value))}
-            />
-          </label>
-        </div>
+        {appView === 'trend' ? (
+          <>
+            <div className="controls-grid">
+              <label htmlFor="fromYear">
+                Fra år
+                <input
+                  id="fromYear"
+                  type="number"
+                  min={MIN_YEAR}
+                  max={MAX_YEAR}
+                  value={selectedFromYear}
+                  onChange={(event) => setFromYear(Number(event.target.value))}
+                  disabled={detailMode}
+                />
+              </label>
+              <label htmlFor="toYear">
+                Til år
+                <input
+                  id="toYear"
+                  type="number"
+                  min={MIN_YEAR}
+                  max={MAX_YEAR}
+                  value={selectedToYear}
+                  onChange={(event) => setToYear(Number(event.target.value))}
+                />
+              </label>
+            </div>
 
-        {detailMode ? (
-          <label htmlFor="detailPeriodYears">
-            Detaljperiode
-            <select
-              id="detailPeriodYears"
-              value={detailPeriodYears}
-              onChange={(event) =>
-                setDetailPeriodYears(Number(event.target.value) as 5 | 10)
-              }
-            >
-              <option value={5}>5 år</option>
-              <option value={10}>10 år</option>
-            </select>
-          </label>
-        ) : null}
+            {detailMode ? (
+              <label htmlFor="detailPeriodYears">
+                Detaljperiode
+                <select
+                  id="detailPeriodYears"
+                  value={effectiveDetailPeriodYears}
+                  onChange={(event) =>
+                    setDetailPeriodYears(Number(event.target.value) as DetailWindowYears)
+                  }
+                >
+                  {detailWindowOptions.map((years) => (
+                    <option key={years} value={years}>
+                      {years} år
+                    </option>
+                  ))}
+                </select>
+              </label>
+            ) : null}
+          </>
+        ) : (
+          <div className="controls-grid">
+            <label htmlFor="snippetFromYear">
+              Fra år (snippets)
+              <input
+                id="snippetFromYear"
+                type="number"
+                min={MIN_YEAR}
+                max={MAX_YEAR}
+                value={selectedFromYear}
+                onChange={(event) => setFromYear(Number(event.target.value))}
+              />
+            </label>
+            <label htmlFor="snippetToYear">
+              Til år (snippets)
+              <input
+                id="snippetToYear"
+                type="number"
+                min={MIN_YEAR}
+                max={MAX_YEAR}
+                value={selectedToYear}
+                onChange={(event) => setToYear(Number(event.target.value))}
+              />
+            </label>
+            <label htmlFor="maxSnippetDocuments">
+              Maks dokumenter
+              <input
+                id="maxSnippetDocuments"
+                type="number"
+                min={10}
+                max={2000}
+                step={10}
+                value={maxSnippetDocuments}
+                onChange={(event) => setMaxSnippetDocuments(Number(event.target.value))}
+              />
+            </label>
+            <label htmlFor="snippetFragments">
+              Fragments per dokument
+              <input
+                id="snippetFragments"
+                type="number"
+                min={1}
+                max={5}
+                value={snippetFragments}
+                onChange={(event) => setSnippetFragments(Number(event.target.value))}
+              />
+            </label>
+            <label htmlFor="snippetFragSize">
+              Tegn per fragment
+              <input
+                id="snippetFragSize"
+                type="number"
+                min={50}
+                max={1000}
+                step={50}
+                value={snippetFragSize}
+                onChange={(event) => setSnippetFragSize(Number(event.target.value))}
+              />
+            </label>
+          </div>
+        )}
 
         <label htmlFor="strokeWidth">
           Linjetykkelse: {strokeWidth}
@@ -500,25 +850,82 @@ function App() {
             type="checkbox"
             checked={relativeMode}
             onChange={(event) => setRelativeMode(event.target.checked)}
-            disabled={detailMode}
+            disabled={detailMode || appView === 'snippets'}
           />
           Relativ visning (% av total per bucket)
         </label>
 
-        {detailMode ? (
+        {appView === 'trend' && detailMode ? (
           <p className="hint">
-            Måned/dag bygges fra `items`-data og er avgrenset til {detailPeriodYears} år.
+            Måned/dag bygges fra `items`-data og er avgrenset til {effectiveDetailPeriodYears} år.
+          </p>
+        ) : null}
+
+        {appView === 'snippets' ? (
+          <p className="hint">
+            Snippets hentes via `items/searchafter` i batcher på {SNIPPET_BATCH_SIZE}, filtrert til perioden {selectedFromYear}-{selectedToYear}.
           </p>
         ) : null}
 
         <button type="submit" disabled={loading}>
-          {loading ? 'Henter...' : 'Hent trend'}
+          {loading ? 'Henter...' : appView === 'snippets' ? 'Hent snippets' : 'Hent trend'}
         </button>
+
+        {appView === 'snippets' && snippetProgress.running ? (
+          <button
+            type="button"
+            onClick={() => {
+              snippetStopRef.current = true
+            }}
+          >
+            Stopp henting
+          </button>
+        ) : null}
       </form>
 
       {error ? <p className="error">{error}</p> : null}
 
-      {series.length > 0 ? (
+      {appView === 'snippets' ? (
+        <section className="chart-section">
+          <div className="meta">
+            <h2>Snippets</h2>
+            <p>
+              Skannet {snippetProgress.scanned.toLocaleString('nb-NO')} av{' '}
+              {snippetProgress.target.toLocaleString('nb-NO')} dokumenter.
+            </p>
+            <p>
+              Dokumenter med snippet: {snippetProgress.withSnippets.toLocaleString('nb-NO')}
+            </p>
+            <p>Totale fragmenter hentet: {snippetHits.length.toLocaleString('nb-NO')}</p>
+          </div>
+          {snippetHits.length > 0 ? (
+            <>
+              <div className="export-actions">
+                <button type="button" onClick={exportSnippetsAsCsv}>
+                  Last ned CSV
+                </button>
+                <button type="button" onClick={exportSnippetsAsJson}>
+                  Last ned JSON
+                </button>
+              </div>
+              <div className="snippet-list">
+                {snippetHits.slice(0, 200).map((hit, index) => (
+                  <article className="snippet-item" key={`${hit.itemId}-${hit.pageId ?? index}-${index}`}>
+                    <p className="snippet-meta">
+                      ID: {hit.itemId} {hit.pageNumber ? `| Side: ${hit.pageNumber}` : ''}
+                    </p>
+                    <p dangerouslySetInnerHTML={{ __html: hit.text }} />
+                  </article>
+                ))}
+              </div>
+            </>
+          ) : (
+            <p className="hint">
+              Ingen snippets ennå. Kjør et snippetsøk for å hente tekstfragmenter.
+            </p>
+          )}
+        </section>
+      ) : series.length > 0 ? (
         <section className="chart-section">
           <div className="meta">
             <h2>Treff per {granularity === 'year' ? 'år' : granularity === 'month' ? 'måned' : 'dag'}</h2>
